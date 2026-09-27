@@ -13,7 +13,6 @@
 #include "harness/harness.h"
 #include "model/replay_client.h"
 #include "model/scripted_client.h"
-
 #include <cassert>
 #include <cstdio>
 #include <fstream>
@@ -23,8 +22,59 @@
 #include <utility>
 #include <vector>
 
+
+// this provides the user input we want the harness to receive
+class FakeUserInput : public InputSource {
+public:
+    explicit FakeUserInput(std::vector<std::string> input_lines) : input_lines_(std::move(input_lines)) {
+    }
+
+    std::string read_line() override {
+
+
+        //there are no more user messages left
+
+        if (next_line_ == input_lines_.size()) {
+            reached_end_ = true;
+            return "";
+        }
+
+        return input_lines_[next_line_++];
+    }
+
+
+    bool is_eof() const override {
+        return reached_end_;
+    }
+
+
+
+private:
+    std::vector<std::string> input_lines_;
+    std::size_t next_line_ = 0;
+    bool reached_end_ = false;
+};
+
+
+
+//this saves everything the harness tries to print
+
+
+class SavedProgramOutput : public OutputSink {
+public:
+
+    void write(std::string_view new_text) override {
+        saved_text += new_text;
+    }
+
+
+    std::string saved_text;
+};
+
+
+
 int main() {
-    // TODO: write your tests here.
+    // write your tests here.
 
 //test 1 makes sure a new conversation starts empty
     {
@@ -386,38 +436,266 @@ int main() {
 
 
 
-//test 12 feeds a large stream by going one character at a time
 
+
+//test 12 feeds a large stream one character at a time
 {
-    SentinelScanner scanner("<|end_conversation|>");
+
+    const std::string sentinel = "<|end_conversation|>";
+
+    SentinelScanner scanner(sentinel);
 
 
 
 
     const std::size_t total_characters = 4 * 1024 * 1024;
-    std::size_t returned_characters = 0;
+
+    std::size_t characters_sent = 0;
+    std::size_t characters_returned = 0;
 
 
-    //this checks that the scanner can handle a long stream without saving all of it
+
+    // the scanner should never hold more than sentinel length minus one
     for (std::size_t i = 0; i < total_characters; i++) {
-
         auto result = scanner.feed("x");
 
+        characters_sent++;
+        characters_returned += result.safe_text.size();
+
         assert(!result.sentinel_found);
-        returned_characters += result.safe_text.size();
+
+
+        //anything not returned yet is still being held by the scanner
+        std::size_t characters_held = characters_sent - characters_returned;
+        assert(characters_held <= sentinel.size() - 1);
+
+
     }
 
 
-    // add the final characters that were still waiting
-
+    //release the final characters still being held
 
     auto last = scanner.flush();
-    returned_characters += last.safe_text.size();
+    characters_returned += last.safe_text.size();
 
 
-    assert(returned_characters == total_characters);
+
+    assert(!last.sentinel_found);
+    assert(characters_returned == total_characters);
 
 }
+
+
+
+
+
+
+
+// test 13 makes sure the harness stops when it reaches the turn limit
+{
+    const std::string script_path = "turn_limit_test.script";
+
+
+    // we create two normal model replies
+    {
+        std::ofstream script_file(script_path);
+
+
+        script_file << "role: assistant\n";
+        script_file << "first reply\n";
+        script_file << "---\n";
+        script_file << "role: assistant\n";
+        script_file << "second reply\n";
+
+    }
+
+
+    auto model = std::make_unique<ScriptedModelClient>(script_path);
+
+
+
+    HarnessConfig settings;
+    settings.max_turns = 2;
+    // 2 max turns
+
+
+    Harness harness(std::move(model), settings);
+
+
+    FakeUserInput user_input({"first question", "second question"});
+    SavedProgramOutput program_output;
+
+
+    StopReason result = harness.run(user_input, program_output);
+
+
+    //both turns were used so the turn limit should stop the harness
+    assert(result.kind == StopReason::Kind::TurnLimit);
+
+
+    //each turn adds one user message and one assistant message
+    assert(harness.conversation().size() == 4);
+
+
+    std::remove(script_path.c_str());
+}
+
+
+
+
+
+
+//test 14 makes sure the harness stops when the sentinel is found
+{
+    const std::string script_path = "sentinel_test.script";
+
+
+
+    //chunk size one sends the reply one character at a time
+    {
+
+
+        std::ofstream script_file(script_path);
+
+        script_file << "chunk: 1\n";
+        script_file << "role: assistant\n";
+        script_file << "goodbye.<|end_conversation|>\n";
+    }
+
+
+
+    auto model = std::make_unique<ScriptedModelClient>(script_path);
+
+
+
+    HarnessConfig settings;
+
+    Harness harness(std::move(model), settings);
+
+
+    FakeUserInput user_input({"bye"});
+    SavedProgramOutput program_output;
+
+    StopReason result = harness.run(user_input, program_output);
+
+
+    //the sentinel should stop the harness after the first reply
+    assert(result.kind == StopReason::Kind::Sentinel);
+
+
+
+    //the reply should be printed without showing the sentinel
+
+    assert(program_output.saved_text.find("goodbye.") != std::string::npos);
+    assert(program_output.saved_text.find("<|end_conversation|>") == std::string::npos);
+
+
+
+    //the stored assistant message still needs the sentinel for replay
+
+    assert(harness.conversation().size() == 2);
+    assert(harness.conversation().at(1).content() == "goodbye.<|end_conversation|>");
+
+
+    std::remove(script_path.c_str());
+}
+
+
+
+
+
+// test 15 makes sure a transcript replays the same assistant messages
+{
+
+    const std::string transcript_path = "replay_test.txt";
+
+
+    //create a small transcript with two assistant replies
+    {
+        std::ofstream transcript_file(transcript_path);
+
+        transcript_file << "role: user\n";
+        transcript_file << "hello\n";
+        transcript_file << "---\n";
+
+        transcript_file << "role: assistant\n";
+        transcript_file << "hi there\n";
+        transcript_file << "---\n";
+
+        transcript_file << "role: user\n";
+        transcript_file << "bye\n";
+        transcript_file << "---\n";
+
+        transcript_file << "role: assistant\n";
+        transcript_file << "goodbye.<|end_conversation|>\n";
+    }
+
+
+    ReplayModelClient replay(transcript_path);
+    Conversation conversation;
+
+
+    Message first_reply = replay.generate(conversation);
+
+    Message second_reply = replay.generate(conversation);
+
+
+
+    // the replayed replies should match the transcript
+
+    assert(first_reply.role() == Role::Assistant);
+    assert(first_reply.content() == "hi there");
+
+    assert(second_reply.role() == Role::Assistant);
+    assert(second_reply.content() == "goodbye.<|end_conversation|>");
+
+
+    std::remove(transcript_path.c_str());
+}
+
+
+
+
+
+
+//test 16 makes sure eof ends the conversation cleanly
+{
+    const std::string script_path = "eof_test.script";
+
+
+    // the model will not be called but it still needs a valid script
+    {
+        std::ofstream script_file(script_path);
+
+        script_file << "role: assistant\n";
+        script_file << "unused reply\n";
+    }
+
+
+    auto model = std::make_unique<ScriptedModelClient>(script_path);
+
+    HarnessConfig settings;
+    Harness harness(std::move(model), settings);
+
+
+    // the no input lines makes the input reach eof immediately
+    FakeUserInput user_input({});
+    SavedProgramOutput program_output;
+
+    StopReason result = harness.run(user_input, program_output);
+
+
+    assert(result.kind == StopReason::Kind::UserExit);
+    assert(harness.conversation().size() == 0);
+
+
+    std::remove(script_path.c_str());
+}
+
+
+
+
+
 
 
     return 0;
