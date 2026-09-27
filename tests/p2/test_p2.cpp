@@ -134,7 +134,8 @@ int main() {
 
 
     //this checks that self assignment does not damage anything
-    copy = copy;
+    Conversation* same_conversation = &copy;
+    copy = *same_conversation;
 
     assert(copy.size() == 1);
     assert(copy.at(0).content() == "copied message");
@@ -415,7 +416,7 @@ int main() {
 
 
     assert(returned_characters == total_characters);
-    
+
 }
 
 
